@@ -1,0 +1,17 @@
+# Environment variables (Private Keys, RPC URLs)
+.env
+.env.local
+
+# Dependencies
+node_modules/
+
+# Hardhat / Build artifacts
+artifacts/
+cache/
+typechain/
+typechain-types/
+
+# OS files
+.DS_Store
+Thumbs.db
+12 AUG 26 deployment.txt
