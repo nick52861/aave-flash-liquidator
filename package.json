@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
+    "start": "node scripts/bot.js",
     "compile": "hardhat compile"
   },
   "devDependencies": {
@@ -21,8 +22,6 @@
     "@types/mocha": "^10.0.10",
     "@types/node": "^26.2.0",
     "chai": "^4.5.0",
-    "dotenv": "^16.4.5",
-    "ethers": "^6.17.0",
     "hardhat": "^2.22.0",
     "hardhat-gas-reporter": "^1.0.10",
     "solidity-coverage": "^0.8.17",
@@ -31,6 +30,8 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.17.0",
     "express": "^5.2.1"
   }
 }
