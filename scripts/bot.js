@@ -1,225 +1,365 @@
 import { ethers } from "ethers";
 import dotenv from "dotenv";
+import express from "express";
+import fs from "fs";
+import path from "path";
+import WebSocket from "ws";
+import { Worker } from "worker_threads";
 
 dotenv.config();
-import express from "express";
 
 // -------------------------------------------------------------------
-// KEEP-ALIVE HTTP SERVER FOR RENDER & UPTIMEROBOT
+// CONFIGURATION
 // -------------------------------------------------------------------
-const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.get("/", (req, res) => {
-  res.send("🤖 Aave V3 Liquidation Bot is active and monitoring Base blocks!");
-});
-
-app.listen(PORT, () => {
-  console.log(`🌐 Keep-alive server running on port ${PORT}`);
-});
-
-// -------------------------------------------------------------------
-// CONFIGURATION & CONSTANTS
-// -------------------------------------------------------------------
-const RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
+const RAW_RPC_URL = process.env.BASE_RPC_URL || "wss://mainnet.base.org/ws";
+const HTTP_RPC_URL = process.env.HTTP_RPC_URL || "https://mainnet.base.org";
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
-let contractAddr = process.env.CONTRACT_ADDRESS || "0x82F3F2f5F53E31BeB69F6c51298cB708e993b3aB";
-if (contractAddr.startsWith("0x0x")) {
-  contractAddr = contractAddr.replace("0x0x", "0x");
-}
+// Flashbots Relay / Private RPC for Base
+const FLASHBOTS_RELAY_URL = process.env.FLASHBOTS_RELAY_URL || "https://rpc.flashbots.net/base";
+
+let contractAddr = process.env.CONTRACT_ADDRESS || "0x4b40aCb12A39312bb00d491a8baAf363bcAE8Bc7";
+if (contractAddr.startsWith("0x0x")) contractAddr = contractAddr.replace("0x0x", "0x");
 const FLASH_LIQUIDATOR_ADDRESS = contractAddr;
 
-const POOL_ADDRESS = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5"; // Aave V3 Base Pool
-const USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC
-const WETH_ADDRESS = "0x4200000000000000000000000000000000000006"; // WETH
-const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"; // Multicall3 on Base
+const POOL_ADDRESS = "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5";
+const USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+const WETH_ADDRESS = "0x4200000000000000000000000000000000000006";
+const MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11";
+const CACHE_FILE = path.join(process.cwd(), "borrowers.json");
 
-const provider = new ethers.JsonRpcProvider(RPC_URL);
+// Cap real-time block audits to top 20 targets to maintain sub-30ms performance
+const MAX_WATCHLIST_SIZE = 20;
+
+// -------------------------------------------------------------------
+// KEEP-ALIVE SERVER
+// -------------------------------------------------------------------
+const app = express();
+app.get("/", (_, res) => res.send("🤖 Aave V3 Sub-30ms Liquidator Active"));
+app.listen(PORT, () => console.log(`🌐 Keep-alive server running on port ${PORT}`));
+
+// -------------------------------------------------------------------
+// ABI INTERFACES
+// -------------------------------------------------------------------
+const poolInterface = new ethers.Interface([
+  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)"
+]);
+
+const multicallInterface = new ethers.Interface([
+  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external payable returns (tuple(bool success, bytes returnData)[] returnData)"
+]);
+
+const flashLiquidatorInterface = new ethers.Interface([
+  "function executeFlashLiquidation(address collateralAsset, address debtAsset, address targetUser, uint256 debtToCover, uint24 poolFee) external"
+]);
+
+// Providers & Wallet
+const provider = new ethers.JsonRpcProvider(HTTP_RPC_URL, 8453, { staticNetwork: true });
 const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
-// -------------------------------------------------------------------
-// ABIS
-// -------------------------------------------------------------------
-const POOL_ABI = [
-  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)",
-  "event Borrow(address indexed reserve, address user, address indexed onBehalfOf, uint256 amount, uint8 interestRateMode, uint256 borrowRate, uint16 indexed referralCode)"
-];
+// Native WebSocket Driver State
+let wsClient;
+let requestId = 1;
+const rpcCallbacks = new Map();
 
-const MULTICALL_ABI = [
-  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external view returns (tuple(bool success, bytes returnData)[] returnData)"
-];
-
-const FLASH_LIQUIDATOR_ABI = [
-  "function executeFlashLiquidation(address collateralAsset, address debtAsset, address targetUser, uint256 debtToCover, uint24 poolFee) external",
-  "function withdrawToken(address tokenAddress) external",
-  "function withdrawETH() external"
-];
-
-const ERC20_ABI = [
-  "function balanceOf(address account) external view returns (uint256)"
-];
-
-// Contract Instances
-const pool = new ethers.Contract(POOL_ADDRESS, POOL_ABI, provider);
-const multicallContract = new ethers.Contract(MULTICALL3_ADDRESS, MULTICALL_ABI, provider);
-const liquidatorContract = new ethers.Contract(FLASH_LIQUIDATOR_ADDRESS, FLASH_LIQUIDATOR_ABI, wallet);
-const usdcContract = new ethers.Contract(USDC_ADDRESS, ERC20_ABI, provider);
-
-// State Management
+// Runtime Application State
 const targetUsers = new Set();
+let activeWatchlist = [];
+let cachedCallsArray = [];
+const precalculatedCalls = new Map();
 const pendingLiquidations = new Set();
-let lastScannedBlock = 0;
-let isScanning = false; // Concurrency lock for rapid Base block ticks
+
+let isWorkerScanning = false;
+let isAuditing = false; // Lock to prevent WS block stacking
+let blockCounter = 0;
+let currentBlockNumber = 0;
+
+let currentNonce = null;
+let cachedMaxFeePerGas = null;
+let cachedMaxPriorityFeePerGas = null;
 
 // -------------------------------------------------------------------
-// BORROWER INDEXING
+// FAST PRE-ENCODING & WATCHLIST MANAGEMENT
 // -------------------------------------------------------------------
-async function fetchRecentBorrowers() {
-  console.log("🔄 Indexing recent Aave V3 borrowers on Base...");
-  try {
-    const currentBlock = await provider.getBlockNumber();
-    lastScannedBlock = currentBlock;
-    
-    const fromBlock = Math.max(0, currentBlock - 1500); // ~1 hour lookback
-    const borrowEvents = await pool.queryFilter(pool.filters.Borrow(), fromBlock, currentBlock);
-    
-    borrowEvents.forEach(event => {
-      const user = event.args.onBehalfOf || event.args.user;
-      if (user) targetUsers.add(user);
+function precalculateCallStruct(user) {
+  if (!precalculatedCalls.has(user)) {
+    const callData = poolInterface.encodeFunctionData("getUserAccountData", [user]);
+    precalculatedCalls.set(user, {
+      target: POOL_ADDRESS,
+      allowFailure: true,
+      callData: callData
     });
+  }
+  return precalculatedCalls.get(user);
+}
 
-    console.log(`✅ Loaded ${targetUsers.size} unique active borrowers into queue.\n`);
-  } catch (err) {
-    console.warn("⚠️ Historical indexing notice:", err.message);
+function updateWatchlistCalls(newList) {
+  activeWatchlist = newList.slice(0, MAX_WATCHLIST_SIZE);
+  
+  cachedCallsArray = new Array(activeWatchlist.length);
+  for (let i = 0; i < activeWatchlist.length; i++) {
+    cachedCallsArray[i] = precalculateCallStruct(activeWatchlist[i]);
   }
 }
 
-async function checkForNewBorrowers() {
+function loadCachedBorrowers() {
   try {
-    const currentBlock = await provider.getBlockNumber();
-    if (currentBlock <= lastScannedBlock) return;
-
-    const newEvents = await pool.queryFilter(pool.filters.Borrow(), lastScannedBlock + 1, currentBlock);
-    newEvents.forEach(event => {
-      const borrower = event.args.onBehalfOf || event.args.user;
-      if (borrower && !targetUsers.has(borrower)) {
-        targetUsers.add(borrower);
-        console.log(`⚡ Real-time borrower detected: ${borrower}`);
+    if (fs.existsSync(CACHE_FILE)) {
+      const parsedData = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+      if (Array.isArray(parsedData)) {
+        parsedData.forEach((addr) => {
+          if (ethers.isAddress(addr) && addr !== ethers.ZeroAddress) {
+            targetUsers.add(addr);
+            precalculateCallStruct(addr);
+          }
+        });
+        console.log(`📂 Loaded ${targetUsers.size} cached borrowers from borrowers.json`);
       }
-    });
-
-    lastScannedBlock = currentBlock;
-  } catch (err) {}
+    }
+  } catch (err) {
+    console.warn(`⚠️ Cache load error: ${err.message}`);
+  }
 }
 
 // -------------------------------------------------------------------
-// FLASH LOAN EXECUTION ENGINE WITH PROFIT TRACKING
+// STATE PRE-WARMING (NONCE & GAS FEE SYNC)
 // -------------------------------------------------------------------
-async function executeLiquidation(targetUser, healthFactor, totalDebtUSD) {
+async function syncGasAndNonce() {
+  try {
+    const [feeData, nonce] = await Promise.all([
+      provider.getFeeData(),
+      provider.getTransactionCount(wallet.address, "pending")
+    ]);
+    
+    if (feeData.maxFeePerGas) {
+      cachedMaxFeePerGas = (feeData.maxFeePerGas * 120n) / 100n;
+    }
+    if (feeData.maxPriorityFeePerGas) {
+      cachedMaxPriorityFeePerGas = (feeData.maxPriorityFeePerGas * 120n) / 100n;
+    }
+    currentNonce = nonce;
+  } catch (err) {
+    console.warn(`⚠️ Gas/Nonce sync error: ${err.message}`);
+  }
+}
+
+// -------------------------------------------------------------------
+// BACKGROUND WORKER (BACKGROUND SCAN)
+// -------------------------------------------------------------------
+function triggerBackgroundFullScan() {
+  if (isWorkerScanning || targetUsers.size === 0) return;
+  isWorkerScanning = true;
+
+  const worker = new Worker(path.join(process.cwd(), "scripts", "fullScanWorker.js"), {
+    workerData: {
+      rpcUrl: HTTP_RPC_URL,
+      poolAddress: POOL_ADDRESS,
+      multicallAddress: MULTICALL3_ADDRESS,
+      targets: Array.from(targetUsers),
+    },
+  });
+
+  worker.on("message", (data) => {
+    if (data.watchlist) {
+      updateWatchlistCalls(data.watchlist);
+      console.log(`⚡ [FULL SCAN WORKER] Scanned ${data.scannedCount} users in ${data.durationMs}ms | Active Positions: ${data.activePositionsFound || 0} | Watchlist Capped At: ${activeWatchlist.length}`);
+    }
+    isWorkerScanning = false;
+  });
+
+  worker.on("error", () => { isWorkerScanning = false; });
+  worker.on("exit", () => { isWorkerScanning = false; });
+}
+
+// -------------------------------------------------------------------
+// RAW WEBSOCKET CLIENT MANAGEMENT
+// -------------------------------------------------------------------
+function sendRawRpcRequest(method, params) {
+  return new Promise((resolve, reject) => {
+    const id = requestId++;
+    rpcCallbacks.set(id, { resolve, reject });
+    const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    if (wsClient && wsClient.readyState === WebSocket.OPEN) {
+      wsClient.send(payload);
+    } else {
+      reject(new Error("WebSocket not connected"));
+    }
+  });
+}
+
+function initWebSocketClient() {
+  wsClient = new WebSocket(RAW_RPC_URL);
+
+  wsClient.on("open", () => {
+    console.log("⚡ Low-Latency Native WebSocket Driver Connected.");
+    wsClient.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 999,
+      method: "eth_subscribe",
+      params: ["newHeads"]
+    }));
+  });
+
+  wsClient.on("message", (data) => {
+    const response = JSON.parse(data.toString());
+
+    if (response.id && rpcCallbacks.has(response.id)) {
+      const { resolve, reject } = rpcCallbacks.get(response.id);
+      rpcCallbacks.delete(response.id);
+      if (response.error) reject(response.error);
+      else resolve(response.result);
+      return;
+    }
+
+    if (response.method === "eth_subscription") {
+      const blockNumHex = response.params?.result?.number;
+      if (blockNumHex) {
+        currentBlockNumber = parseInt(blockNumHex, 16);
+        auditWatchlistRaw(currentBlockNumber);
+      }
+    }
+  });
+
+  wsClient.on("error", (err) => console.error(`⚠️ WS Error: ${err.message}`));
+  wsClient.on("close", () => {
+    console.warn("⚠️ WS Connection lost. Reconnecting in 1s...");
+    setTimeout(initWebSocketClient, 1000);
+  });
+}
+
+// -------------------------------------------------------------------
+// SUB-30MS WATCHLIST AUDIT LOOP
+// -------------------------------------------------------------------
+async function auditWatchlistRaw(blockNumber) {
+  blockCounter++;
+  if (blockCounter % 50 === 1) triggerBackgroundFullScan();
+  
+  if (cachedCallsArray.length === 0 || isAuditing) return;
+
+  isAuditing = true;
+  const startTime = Date.now();
+
+  try {
+    const calldataHex = multicallInterface.encodeFunctionData("aggregate3", [cachedCallsArray]);
+
+    const rawHexResult = await sendRawRpcRequest("eth_call", [
+      { to: MULTICALL3_ADDRESS, data: calldataHex },
+      "latest"
+    ]);
+
+    if (!rawHexResult || rawHexResult === "0x") {
+      isAuditing = false;
+      return;
+    }
+
+    const decoded = multicallInterface.decodeFunctionResult("aggregate3", rawHexResult);
+    const results = decoded[0];
+
+    for (let i = 0; i < results.length; i++) {
+      const { success, returnData } = results[i];
+      if (!success || returnData === "0x") continue;
+
+      const user = activeWatchlist[i];
+      const parsedData = poolInterface.decodeFunctionResult("getUserAccountData", returnData);
+
+      const totalDebtUSD = Number(parsedData.totalDebtBase) / 1e8;
+      const healthFactor = Number(parsedData.healthFactor) / 1e18;
+
+      if (totalDebtUSD > 10 && healthFactor < 1.0) {
+        console.log(`🚨 INSOLVENT TARGET FOUND: ${user} | Debt: $${totalDebtUSD.toFixed(2)} | HF: ${healthFactor.toFixed(4)}`);
+        executeLiquidationBundle(user, healthFactor, totalDebtUSD);
+      }
+    }
+
+    const elapsed = Date.now() - startTime;
+    console.log(`⚡ [Block #${blockNumber}] [WATCHLIST] Audited ${activeWatchlist.length} targets in ${elapsed}ms`);
+  } catch (err) {
+    console.warn(`⚠️ Watchlist audit error on block #${blockNumber}:`, err.message || err);
+  } finally {
+    isAuditing = false;
+  }
+}
+
+// -------------------------------------------------------------------
+// EXECUTION METHOD 2: FLASHBOTS BUNDLE SUBMISSION (eth_sendBundle)
+// -------------------------------------------------------------------
+async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) {
   if (pendingLiquidations.has(targetUser)) return;
   pendingLiquidations.add(targetUser);
 
   try {
-    console.log(`\n====================================================`);
-    console.log(`🚨 UNHEALTHY POSITION DETECTED!`);
-    console.log(`User: ${targetUser} | HF: ${healthFactor.toFixed(4)}`);
-    console.log(`====================================================`);
-
-    // Record initial deployer USDC balance
-    const initialUsdcBalance = await usdcContract.balanceOf(wallet.address);
-
+    console.log(`🚀 Executing Flashbots Bundle Liquidation on target: ${targetUser}`);
+    
     const closeFactor = healthFactor > 0.95 ? 0.50 : 1.00;
-    const targetDebtUSD = totalDebtUSD * closeFactor;
-    const debtToCover = ethers.parseUnits(targetDebtUSD.toFixed(6), 6);
-    const UNISWAP_V3_FEE = 500; // 0.05% Pool Fee
+    const debtToCover = ethers.parseUnits((totalDebtUSD * closeFactor).toFixed(6), 6);
+    const UNISWAP_V3_FEE = 500;
 
-    const feeData = await provider.getFeeData();
-
-    const tx = await liquidatorContract.executeFlashLiquidation(
+    // 1. Local Offline Calldata Encoding
+    const calldata = flashLiquidatorInterface.encodeFunctionData("executeFlashLiquidation", [
       WETH_ADDRESS,
       USDC_ADDRESS,
       targetUser,
       debtToCover,
       UNISWAP_V3_FEE,
-      {
-        gasLimit: 800000,
-        maxFeePerGas: feeData.maxFeePerGas ? (feeData.maxFeePerGas * 120n) / 100n : undefined,
-        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ? (feeData.maxPriorityFeePerGas * 120n) / 100n : undefined,
-      }
-    );
+    ]);
 
-    console.log(`🚀 Transaction Submitted: https://basescan.org/tx/${tx.hash}`);
-    const receipt = await tx.wait();
-    console.log(`✅ Flash Liquidation Confirmed in Block #${receipt.blockNumber}`);
+    const targetNonce = currentNonce !== null ? currentNonce++ : await provider.getTransactionCount(wallet.address, "pending");
 
-    // Check new USDC balance & log net profit credited to deployer
-    const finalUsdcBalance = await usdcContract.balanceOf(wallet.address);
-    const profitMade = finalUsdcBalance - initialUsdcBalance;
+    // 2. Build Unsigned EIP-1559 Transaction Object
+    const txUnsigned = {
+      to: FLASH_LIQUIDATOR_ADDRESS,
+      data: calldata,
+      gasLimit: 800000n,
+      maxFeePerGas: cachedMaxFeePerGas,
+      maxPriorityFeePerGas: cachedMaxPriorityFeePerGas,
+      nonce: targetNonce,
+      chainId: 8453, // Base Mainnet
+      type: 2,
+    };
 
-    if (profitMade > 0n) {
-      console.log(`💰 PROFIT CREDITED TO DEPLOYER: +$${ethers.formatUnits(profitMade, 6)} USDC 🎉`);
+    // 3. Sign Locally (Zero-Delay)
+    const signedTxHex = await wallet.signTransaction(txUnsigned);
+
+    // Target immediate next block
+    const targetBlock = currentBlockNumber > 0 ? currentBlockNumber + 1 : await provider.getBlockNumber() + 1;
+    const targetBlockHex = "0x" + targetBlock.toString(16);
+
+    // 4. Construct Flashbots eth_sendBundle JSON-RPC Payload
+    const bundlePayload = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_sendBundle",
+      params: [
+        {
+          txs: [signedTxHex],
+          blockNumber: targetBlockHex,
+        },
+      ],
+    };
+
+    console.log(`📦 Submitting Flashbots Bundle targeting block #${targetBlock}...`);
+
+    // 5. Send Bundle Payload to Flashbots Relay Endpoint
+    const response = await fetch(FLASHBOTS_RELAY_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(bundlePayload),
+    });
+
+    const result = await response.json();
+
+    if (result.error) {
+      console.error(`❌ Flashbots Bundle Relay Error:`, result.error.message || result.error);
+      syncGasAndNonce();
     } else {
-      console.log(`ℹ️ Check Basescan for contract token balances.`);
-    }
-
-  } catch (error) {
-    console.error(`❌ Liquidation Failed:`, error.reason || error.message);
-  } finally {
-    pendingLiquidations.delete(targetUser);
-  }
-}
-
-// -------------------------------------------------------------------
-// HEALTH FACTOR MONITORING (MULTICALL3 BATCHED & BLOCK DRIVEN)
-// -------------------------------------------------------------------
-async function scanBorrowers(blockNumber) {
-  // Concurrency Guard: Skip if previous scan is still processing
-  if (isScanning || targetUsers.size === 0) return;
-  isScanning = true;
-
-  try {
-    const usersArray = Array.from(targetUsers);
-    console.log(`📦 [Block #${blockNumber}] Scanning ${usersArray.length} active borrowers via Multicall3...`);
-
-    const BATCH_SIZE = 100; // Batch up to 100 queries per single RPC call
-
-    for (let i = 0; i < usersArray.length; i += BATCH_SIZE) {
-      const batch = usersArray.slice(i, i + BATCH_SIZE);
-
-      // Encode calls into Multicall aggregate3 format
-      const calls = batch.map((user) => ({
-        target: POOL_ADDRESS,
-        allowFailure: true,
-        callData: pool.interface.encodeFunctionData("getUserAccountData", [user])
-      }));
-
-      // Execute batched static call
-      const results = await multicallContract.aggregate3.staticCall(calls);
-
-      for (let j = 0; j < results.length; j++) {
-        const { success, returnData } = results[j];
-        if (!success || returnData === "0x") continue;
-
-        const user = batch[j];
-        const decoded = pool.interface.decodeFunctionResult("getUserAccountData", returnData);
-
-        const totalCollateralUSD = Number(decoded.totalCollateralBase) / 1e8;
-        const totalDebtUSD = Number(decoded.totalDebtBase) / 1e8;
-        const healthFactor = Number(decoded.healthFactor) / 1e18;
-
-        if (totalDebtUSD > 10) {
-          if (healthFactor < 1.0) {
-            console.log(`🚨 INSOLVENT TARGET FOUND: ${user} | Collateral: $${totalCollateralUSD.toFixed(2)} | Debt: $${totalDebtUSD.toFixed(2)} | HF: ${healthFactor.toFixed(4)}`);
-            await executeLiquidation(user, healthFactor, totalDebtUSD);
-          }
-        }
-      }
+      console.log(`⚡ Bundle Submitted Successfully! Response:`, JSON.stringify(result.result || result));
     }
   } catch (err) {
-    console.warn("⚠️ Multicall scan error:", err.message);
+    console.error(`❌ Execution Failed:`, err.reason || err.message);
+    syncGasAndNonce();
   } finally {
-    isScanning = false; // Release lock
+    pendingLiquidations.delete(targetUser);
   }
 }
 
@@ -228,20 +368,19 @@ async function scanBorrowers(blockNumber) {
 // -------------------------------------------------------------------
 async function main() {
   console.log("====================================================");
-  console.log("🤖 Aave V3 Zero-Fee Flash Loan Liquidation Bot");
+  console.log("🤖 Aave V3 Flashbots Bundle Liquidator (Ultra-Fast)");
   console.log(`Deployer Wallet: ${wallet.address}`);
   console.log(`Contract:        ${FLASH_LIQUIDATOR_ADDRESS}`);
+  console.log(`Flashbots Relay: ${FLASHBOTS_RELAY_URL}`);
   console.log("====================================================\n");
 
-  await fetchRecentBorrowers();
+  loadCachedBorrowers();
+  await syncGasAndNonce();
+  
+  triggerBackgroundFullScan();
+  setInterval(syncGasAndNonce, 10000);
 
-  // Periodically update active borrower queue
-  setInterval(checkForNewBorrowers, 10000);
-
-  // Trigger scanning immediately on every new Base block (~2 seconds)
-  provider.on("block", async (blockNumber) => {
-    await scanBorrowers(blockNumber);
-  });
+  initWebSocketClient();
 }
 
 main().catch(console.error);
