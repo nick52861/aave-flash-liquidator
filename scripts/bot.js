@@ -35,6 +35,7 @@ const MAX_WATCHLIST_SIZE = 20;
 
 // Native WebSocket Driver State
 let wsClient;
+let wsPingInterval;
 let requestId = 1;
 const rpcCallbacks = new Map();
 
@@ -53,6 +54,26 @@ let currentBlockNumber = 0;
 let currentNonce = null;
 let cachedMaxFeePerGas = null;
 let cachedMaxPriorityFeePerGas = null;
+
+// -------------------------------------------------------------------
+// IN-MEMORY LIVE LOG BUFFER & LOGGER
+// -------------------------------------------------------------------
+const recentLogs = [];
+const MAX_LOG_BUFFER = 100;
+
+function logger(msg) {
+  const timestamp = new Date().toISOString();
+  const formattedMsg = `[${timestamp}] ${msg}`;
+  
+  // Standard console log for stdout
+  console.log(formattedMsg);
+  
+  // Store in circular buffer for /logs endpoint
+  recentLogs.push(formattedMsg);
+  if (recentLogs.length > MAX_LOG_BUFFER) {
+    recentLogs.shift();
+  }
+}
 
 // -------------------------------------------------------------------
 // BACK4APP KEEP-ALIVE & HEALTH CHECK SERVER
@@ -74,9 +95,21 @@ const getHealthStatus = () => ({
 app.get("/", (_, res) => res.status(200).send("🤖 Aave V3 Sub-30ms Liquidator Active & Running on Back4app"));
 app.get("/health", (_, res) => res.status(200).json(getHealthStatus()));
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🌐 Back4app Health Check Server listening on port ${PORT}`);
+// Live streaming log route (solves real-time logging issue)
+app.get("/logs", (_, res) => {
+  res.setHeader("Content-Type", "text/plain; charset=utf-8");
+  res.status(200).send(recentLogs.join("\n") || "No logs available yet.");
 });
+
+app.listen(PORT, "0.0.0.0", () => {
+  logger(`🌐 Back4app Health Check Server listening on port ${PORT}`);
+});
+
+// Self Keep-Alive Ping (Prevents Back4app Container Sleep / Idle Termination)
+setInterval(() => {
+  fetch(`http://127.0.0.1:${PORT}/health`)
+    .catch(() => {}); // Silent catch for internal loopback
+}, 4 * 60 * 1000); // Ping every 4 minutes
 
 // -------------------------------------------------------------------
 // ABI INTERFACES & PROVIDERS
@@ -132,11 +165,11 @@ function loadCachedBorrowers() {
             precalculateCallStruct(addr);
           }
         });
-        console.log(`📂 Loaded ${targetUsers.size} cached borrowers from borrowers.json`);
+        logger(`📂 Loaded ${targetUsers.size} cached borrowers from borrowers.json`);
       }
     }
   } catch (err) {
-    console.warn(`⚠️ Cache load error: ${err.message}`);
+    logger(`⚠️ Cache load error: ${err.message}`);
   }
 }
 
@@ -158,7 +191,7 @@ async function syncGasAndNonce() {
     }
     currentNonce = nonce;
   } catch (err) {
-    console.warn(`⚠️ Gas/Nonce sync error: ${err.message}`);
+    logger(`⚠️ Gas/Nonce sync error: ${err.message}`);
   }
 }
 
@@ -181,13 +214,13 @@ function triggerBackgroundFullScan() {
   worker.on("message", (data) => {
     if (data.watchlist) {
       updateWatchlistCalls(data.watchlist);
-      console.log(`⚡ [FULL SCAN WORKER] Scanned ${data.scannedCount} users in ${data.durationMs}ms | Active Positions: ${data.activePositionsFound || 0} | Watchlist Capped At: ${activeWatchlist.length}`);
+      logger(`⚡ [FULL SCAN WORKER] Scanned ${data.scannedCount} users in ${data.durationMs}ms | Active Positions: ${data.activePositionsFound || 0} | Watchlist Capped At: ${activeWatchlist.length}`);
     }
     isWorkerScanning = false;
   });
 
   worker.on("error", (err) => { 
-    console.error(`⚠️ Worker Error: ${err.message}`);
+    logger(`⚠️ Worker Error: ${err.message}`);
     isWorkerScanning = false; 
   });
   worker.on("exit", () => { isWorkerScanning = false; });
@@ -210,16 +243,24 @@ function sendRawRpcRequest(method, params) {
 }
 
 function initWebSocketClient() {
+  if (wsPingInterval) clearInterval(wsPingInterval);
   wsClient = new WebSocket(RAW_RPC_URL);
 
   wsClient.on("open", () => {
-    console.log("⚡ Low-Latency Native WebSocket Driver Connected.");
+    logger("⚡ Low-Latency Native WebSocket Driver Connected.");
     wsClient.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 999,
       method: "eth_subscribe",
       params: ["newHeads"]
     }));
+
+    // Keep WebSocket connection alive with RPC pings
+    wsPingInterval = setInterval(() => {
+      if (wsClient.readyState === WebSocket.OPEN) {
+        wsClient.ping();
+      }
+    }, 20000);
   });
 
   wsClient.on("message", (data) => {
@@ -242,13 +283,14 @@ function initWebSocketClient() {
         }
       }
     } catch (err) {
-      console.warn(`⚠️ WS Message Processing Error: ${err.message}`);
+      logger(`⚠️ WS Message Processing Error: ${err.message}`);
     }
   });
 
-  wsClient.on("error", (err) => console.error(`⚠️ WS Driver Error: ${err.message}`));
+  wsClient.on("error", (err) => logger(`⚠️ WS Driver Error: ${err.message}`));
   wsClient.on("close", () => {
-    console.warn("⚠️ WS Connection lost. Reconnecting in 1s...");
+    logger("⚠️ WS Connection lost. Reconnecting in 1s...");
+    if (wsPingInterval) clearInterval(wsPingInterval);
     setTimeout(initWebSocketClient, 1000);
   });
 }
@@ -292,15 +334,15 @@ async function auditWatchlistRaw(blockNumber) {
       const healthFactor = Number(parsedData.healthFactor) / 1e18;
 
       if (totalDebtUSD > 10 && healthFactor < 1.0) {
-        console.log(`🚨 INSOLVENT TARGET FOUND: ${user} | Debt: $${totalDebtUSD.toFixed(2)} | HF: ${healthFactor.toFixed(4)}`);
+        logger(`🚨 INSOLVENT TARGET FOUND: ${user} | Debt: $${totalDebtUSD.toFixed(2)} | HF: ${healthFactor.toFixed(4)}`);
         executeLiquidationBundle(user, healthFactor, totalDebtUSD);
       }
     }
 
     const elapsed = Date.now() - startTime;
-    console.log(`⚡ [Block #${blockNumber}] [WATCHLIST] Audited ${activeWatchlist.length} targets in ${elapsed}ms`);
+    logger(`⚡ [Block #${blockNumber}] [WATCHLIST] Audited ${activeWatchlist.length} targets in ${elapsed}ms`);
   } catch (err) {
-    console.warn(`⚠️ Watchlist audit error on block #${blockNumber}:`, err.message || err);
+    logger(`⚠️ Watchlist audit error on block #${blockNumber}: ${err.message || err}`);
   } finally {
     isAuditing = false;
   }
@@ -314,7 +356,7 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
   pendingLiquidations.add(targetUser);
 
   try {
-    console.log(`🚀 Executing Flashbots Bundle Liquidation on target: ${targetUser}`);
+    logger(`🚀 Executing Flashbots Bundle Liquidation on target: ${targetUser}`);
     
     const closeFactor = healthFactor > 0.95 ? 0.50 : 1.00;
     const debtToCover = ethers.parseUnits((totalDebtUSD * closeFactor).toFixed(6), 6);
@@ -363,7 +405,7 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
       ],
     };
 
-    console.log(`📦 Submitting Flashbots Bundle targeting block #${targetBlock}...`);
+    logger(`📦 Submitting Flashbots Bundle targeting block #${targetBlock}...`);
 
     // 5. Send Bundle Payload to Flashbots Relay Endpoint
     const response = await fetch(FLASHBOTS_RELAY_URL, {
@@ -375,13 +417,13 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
     const result = await response.json();
 
     if (result.error) {
-      console.error(`❌ Flashbots Bundle Relay Error:`, result.error.message || result.error);
+      logger(`❌ Flashbots Bundle Relay Error: ${result.error.message || result.error}`);
       syncGasAndNonce();
     } else {
-      console.log(`⚡ Bundle Submitted Successfully! Response:`, JSON.stringify(result.result || result));
+      logger(`⚡ Bundle Submitted Successfully! Response: ${JSON.stringify(result.result || result)}`);
     }
   } catch (err) {
-    console.error(`❌ Execution Failed:`, err.reason || err.message);
+    logger(`❌ Execution Failed: ${err.reason || err.message}`);
     syncGasAndNonce();
   } finally {
     pendingLiquidations.delete(targetUser);
@@ -392,23 +434,23 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
 // PROCESS EXCEPTION HANDLERS (KEEPS BOT ALIVE ON UNEXPECTED ERRORS)
 // -------------------------------------------------------------------
 process.on("uncaughtException", (err) => {
-  console.error("⚠️ Global Uncaught Exception:", err.message || err);
+  logger(`⚠️ Global Uncaught Exception: ${err.message || err}`);
 });
 
 process.on("unhandledRejection", (reason, promise) => {
-  console.error("⚠️ Global Unhandled Rejection at:", promise, "reason:", reason);
+  logger(`⚠️ Global Unhandled Rejection at: ${promise} reason: ${reason}`);
 });
 
 // -------------------------------------------------------------------
 // INITIALIZATION
 // -------------------------------------------------------------------
 async function main() {
-  console.log("====================================================");
-  console.log("🤖 Aave V3 Flashbots Bundle Liquidator (Back4app Ready)");
-  console.log(`Deployer Wallet: ${wallet.address}`);
-  console.log(`Contract:        ${FLASH_LIQUIDATOR_ADDRESS}`);
-  console.log(`Flashbots Relay: ${FLASHBOTS_RELAY_URL}`);
-  console.log("====================================================\n");
+  logger("====================================================");
+  logger("🤖 Aave V3 Flashbots Bundle Liquidator (Back4app Ready)");
+  logger(`Deployer Wallet: ${wallet.address}`);
+  logger(`Contract:        ${FLASH_LIQUIDATOR_ADDRESS}`);
+  logger(`Flashbots Relay: ${FLASHBOTS_RELAY_URL}`);
+  logger("====================================================\n");
 
   loadCachedBorrowers();
   await syncGasAndNonce();
@@ -419,4 +461,4 @@ async function main() {
   initWebSocketClient();
 }
 
-main().catch(console.error);
+main().catch((err) => logger(`Fatal startup error: ${err.message || err}`));
