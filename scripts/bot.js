@@ -1,3 +1,4 @@
+process.stdout._handle && process.stdout._handle.setBlocking && process.stdout._handle.setBlocking(true);
 import { ethers } from "ethers";
 import dotenv from "dotenv";
 import express from "express";
