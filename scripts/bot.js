@@ -32,32 +32,6 @@ const CACHE_FILE = path.join(process.cwd(), "borrowers.json");
 // Cap real-time block audits to top 20 targets to maintain sub-30ms performance
 const MAX_WATCHLIST_SIZE = 20;
 
-// -------------------------------------------------------------------
-// KEEP-ALIVE SERVER
-// -------------------------------------------------------------------
-const app = express();
-app.get("/", (_, res) => res.send("🤖 Aave V3 Sub-30ms Liquidator Active"));
-app.listen(PORT, () => console.log(`🌐 Keep-alive server running on port ${PORT}`));
-
-// -------------------------------------------------------------------
-// ABI INTERFACES
-// -------------------------------------------------------------------
-const poolInterface = new ethers.Interface([
-  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)"
-]);
-
-const multicallInterface = new ethers.Interface([
-  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external payable returns (tuple(bool success, bytes returnData)[] returnData)"
-]);
-
-const flashLiquidatorInterface = new ethers.Interface([
-  "function executeFlashLiquidation(address collateralAsset, address debtAsset, address targetUser, uint256 debtToCover, uint24 poolFee) external"
-]);
-
-// Providers & Wallet
-const provider = new ethers.JsonRpcProvider(HTTP_RPC_URL, 8453, { staticNetwork: true });
-const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-
 // Native WebSocket Driver State
 let wsClient;
 let requestId = 1;
@@ -78,6 +52,49 @@ let currentBlockNumber = 0;
 let currentNonce = null;
 let cachedMaxFeePerGas = null;
 let cachedMaxPriorityFeePerGas = null;
+
+// -------------------------------------------------------------------
+// BACK4APP KEEP-ALIVE & HEALTH CHECK SERVER
+// -------------------------------------------------------------------
+const app = express();
+
+const getHealthStatus = () => ({
+  status: "OK",
+  service: "Aave V3 Flashbots Liquidator",
+  uptimeSeconds: Math.floor(process.uptime()),
+  currentBlock: currentBlockNumber,
+  wsConnected: wsClient?.readyState === WebSocket.OPEN,
+  watchlistSize: activeWatchlist.length,
+  totalCachedBorrowers: targetUsers.size,
+  isScanning: isWorkerScanning,
+  timestamp: new Date().toISOString()
+});
+
+app.get("/", (_, res) => res.status(200).send("🤖 Aave V3 Sub-30ms Liquidator Active & Running on Back4app"));
+app.get("/health", (_, res) => res.status(200).json(getHealthStatus()));
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🌐 Back4app Health Check Server listening on port ${PORT}`);
+});
+
+// -------------------------------------------------------------------
+// ABI INTERFACES & PROVIDERS
+// -------------------------------------------------------------------
+const poolInterface = new ethers.Interface([
+  "function getUserAccountData(address user) external view returns (uint256 totalCollateralBase, uint256 totalDebtBase, uint256 availableBorrowsBase, uint256 currentLiquidationThreshold, uint256 ltv, uint256 healthFactor)"
+]);
+
+const multicallInterface = new ethers.Interface([
+  "function aggregate3(tuple(address target, bool allowFailure, bytes callData)[] calls) external payable returns (tuple(bool success, bytes returnData)[] returnData)"
+]);
+
+const flashLiquidatorInterface = new ethers.Interface([
+  "function executeFlashLiquidation(address collateralAsset, address debtAsset, address targetUser, uint256 debtToCover, uint24 poolFee) external"
+]);
+
+// Providers & Wallet
+const provider = new ethers.JsonRpcProvider(HTTP_RPC_URL, 8453, { staticNetwork: true });
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
 // -------------------------------------------------------------------
 // FAST PRE-ENCODING & WATCHLIST MANAGEMENT
@@ -168,7 +185,10 @@ function triggerBackgroundFullScan() {
     isWorkerScanning = false;
   });
 
-  worker.on("error", () => { isWorkerScanning = false; });
+  worker.on("error", (err) => { 
+    console.error(`⚠️ Worker Error: ${err.message}`);
+    isWorkerScanning = false; 
+  });
   worker.on("exit", () => { isWorkerScanning = false; });
 }
 
@@ -202,26 +222,30 @@ function initWebSocketClient() {
   });
 
   wsClient.on("message", (data) => {
-    const response = JSON.parse(data.toString());
+    try {
+      const response = JSON.parse(data.toString());
 
-    if (response.id && rpcCallbacks.has(response.id)) {
-      const { resolve, reject } = rpcCallbacks.get(response.id);
-      rpcCallbacks.delete(response.id);
-      if (response.error) reject(response.error);
-      else resolve(response.result);
-      return;
-    }
-
-    if (response.method === "eth_subscription") {
-      const blockNumHex = response.params?.result?.number;
-      if (blockNumHex) {
-        currentBlockNumber = parseInt(blockNumHex, 16);
-        auditWatchlistRaw(currentBlockNumber);
+      if (response.id && rpcCallbacks.has(response.id)) {
+        const { resolve, reject } = rpcCallbacks.get(response.id);
+        rpcCallbacks.delete(response.id);
+        if (response.error) reject(response.error);
+        else resolve(response.result);
+        return;
       }
+
+      if (response.method === "eth_subscription") {
+        const blockNumHex = response.params?.result?.number;
+        if (blockNumHex) {
+          currentBlockNumber = parseInt(blockNumHex, 16);
+          auditWatchlistRaw(currentBlockNumber);
+        }
+      }
+    } catch (err) {
+      console.warn(`⚠️ WS Message Processing Error: ${err.message}`);
     }
   });
 
-  wsClient.on("error", (err) => console.error(`⚠️ WS Error: ${err.message}`));
+  wsClient.on("error", (err) => console.error(`⚠️ WS Driver Error: ${err.message}`));
   wsClient.on("close", () => {
     console.warn("⚠️ WS Connection lost. Reconnecting in 1s...");
     setTimeout(initWebSocketClient, 1000);
@@ -364,11 +388,22 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
 }
 
 // -------------------------------------------------------------------
+// PROCESS EXCEPTION HANDLERS (KEEPS BOT ALIVE ON UNEXPECTED ERRORS)
+// -------------------------------------------------------------------
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Global Uncaught Exception:", err.message || err);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("⚠️ Global Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+// -------------------------------------------------------------------
 // INITIALIZATION
 // -------------------------------------------------------------------
 async function main() {
   console.log("====================================================");
-  console.log("🤖 Aave V3 Flashbots Bundle Liquidator (Ultra-Fast)");
+  console.log("🤖 Aave V3 Flashbots Bundle Liquidator (Back4app Ready)");
   console.log(`Deployer Wallet: ${wallet.address}`);
   console.log(`Contract:        ${FLASH_LIQUIDATOR_ADDRESS}`);
   console.log(`Flashbots Relay: ${FLASHBOTS_RELAY_URL}`);
