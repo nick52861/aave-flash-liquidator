@@ -1,7 +1,6 @@
 process.stdout._handle && process.stdout._handle.setBlocking && process.stdout._handle.setBlocking(true);
 import { ethers } from "ethers";
 import dotenv from "dotenv";
-import express from "express";
 import fs from "fs";
 import path from "path";
 import WebSocket from "ws";
@@ -12,13 +11,15 @@ dotenv.config();
 // -------------------------------------------------------------------
 // CONFIGURATION
 // -------------------------------------------------------------------
-const PORT = process.env.PORT || 3000;
 const RAW_RPC_URL = process.env.BASE_RPC_URL || "wss://mainnet.base.org/ws";
 const HTTP_RPC_URL = process.env.HTTP_RPC_URL || "https://mainnet.base.org";
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
 // Flashbots Relay / Private RPC for Base
 const FLASHBOTS_RELAY_URL = process.env.FLASHBOTS_RELAY_URL || "https://rpc.flashbots.net/base";
+
+// ntfy.sh Topic for Push Notifications (Zero-signup log streaming)
+const NTFY_TOPIC = process.env.NTFY_TOPIC || "aave-liquidator-logs-98123";
 
 let contractAddr = process.env.CONTRACT_ADDRESS || "0x4b40aCb12A39312bb00d491a8baAf363bcAE8Bc7";
 if (contractAddr.startsWith("0x0x")) contractAddr = contractAddr.replace("0x0x", "0x");
@@ -56,60 +57,28 @@ let cachedMaxFeePerGas = null;
 let cachedMaxPriorityFeePerGas = null;
 
 // -------------------------------------------------------------------
-// IN-MEMORY LIVE LOG BUFFER & LOGGER
+// HEADLESS PUSH LOGGER (STDOUT + NTFY.SH)
 // -------------------------------------------------------------------
-const recentLogs = [];
-const MAX_LOG_BUFFER = 100;
-
-function logger(msg) {
+async function logger(msg, title = "Aave Liquidator") {
   const timestamp = new Date().toISOString();
   const formattedMsg = `[${timestamp}] ${msg}`;
   
-  // Standard console log for stdout
+  // Standard stdout log for Back4app Container Console
   console.log(formattedMsg);
-  
-  // Store in circular buffer for /logs endpoint
-  recentLogs.push(formattedMsg);
-  if (recentLogs.length > MAX_LOG_BUFFER) {
-    recentLogs.shift();
+
+  // Dispatch push alert for critical actions or errors via ntfy.sh
+  if (msg.includes("🚨") || msg.includes("🚀") || msg.includes("❌") || msg.includes("⚠️") || msg.includes("🤖")) {
+    try {
+      await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+        method: "POST",
+        headers: { "Title": title, "Priority": msg.includes("🚨") ? "high" : "default" },
+        body: msg
+      });
+    } catch (err) {
+      // Non-blocking log failure
+    }
   }
 }
-
-// -------------------------------------------------------------------
-// BACK4APP KEEP-ALIVE & HEALTH CHECK SERVER
-// -------------------------------------------------------------------
-const app = express();
-
-const getHealthStatus = () => ({
-  status: "OK",
-  service: "Aave V3 Flashbots Liquidator",
-  uptimeSeconds: Math.floor(process.uptime()),
-  currentBlock: currentBlockNumber,
-  wsConnected: wsClient?.readyState === WebSocket.OPEN,
-  watchlistSize: activeWatchlist.length,
-  totalCachedBorrowers: targetUsers.size,
-  isScanning: isWorkerScanning,
-  timestamp: new Date().toISOString()
-});
-
-app.get("/", (_, res) => res.status(200).send("🤖 Aave V3 Sub-30ms Liquidator Active & Running on Back4app"));
-app.get("/health", (_, res) => res.status(200).json(getHealthStatus()));
-
-// Live streaming log route (solves real-time logging issue)
-app.get("/logs", (_, res) => {
-  res.setHeader("Content-Type", "text/plain; charset=utf-8");
-  res.status(200).send(recentLogs.join("\n") || "No logs available yet.");
-});
-
-app.listen(PORT, "0.0.0.0", () => {
-  logger(`🌐 Back4app Health Check Server listening on port ${PORT}`);
-});
-
-// Self Keep-Alive Ping (Prevents Back4app Container Sleep / Idle Termination)
-setInterval(() => {
-  fetch(`http://127.0.0.1:${PORT}/health`)
-    .catch(() => {}); // Silent catch for internal loopback
-}, 4 * 60 * 1000); // Ping every 4 minutes
 
 // -------------------------------------------------------------------
 // ABI INTERFACES & PROVIDERS
@@ -349,7 +318,7 @@ async function auditWatchlistRaw(blockNumber) {
 }
 
 // -------------------------------------------------------------------
-// EXECUTION METHOD 2: FLASHBOTS BUNDLE SUBMISSION (eth_sendBundle)
+// EXECUTION METHOD: FLASHBOTS BUNDLE SUBMISSION
 // -------------------------------------------------------------------
 async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) {
   if (pendingLiquidations.has(targetUser)) return;
@@ -362,7 +331,6 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
     const debtToCover = ethers.parseUnits((totalDebtUSD * closeFactor).toFixed(6), 6);
     const UNISWAP_V3_FEE = 500;
 
-    // 1. Local Offline Calldata Encoding
     const calldata = flashLiquidatorInterface.encodeFunctionData("executeFlashLiquidation", [
       WETH_ADDRESS,
       USDC_ADDRESS,
@@ -373,7 +341,6 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
 
     const targetNonce = currentNonce !== null ? currentNonce++ : await provider.getTransactionCount(wallet.address, "pending");
 
-    // 2. Build Unsigned EIP-1559 Transaction Object
     const txUnsigned = {
       to: FLASH_LIQUIDATOR_ADDRESS,
       data: calldata,
@@ -381,18 +348,14 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
       maxFeePerGas: cachedMaxFeePerGas,
       maxPriorityFeePerGas: cachedMaxPriorityFeePerGas,
       nonce: targetNonce,
-      chainId: 8453, // Base Mainnet
+      chainId: 8453,
       type: 2,
     };
 
-    // 3. Sign Locally (Zero-Delay)
     const signedTxHex = await wallet.signTransaction(txUnsigned);
-
-    // Target immediate next block
     const targetBlock = currentBlockNumber > 0 ? currentBlockNumber + 1 : await provider.getBlockNumber() + 1;
     const targetBlockHex = "0x" + targetBlock.toString(16);
 
-    // 4. Construct Flashbots eth_sendBundle JSON-RPC Payload
     const bundlePayload = {
       jsonrpc: "2.0",
       id: 1,
@@ -407,7 +370,6 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
 
     logger(`📦 Submitting Flashbots Bundle targeting block #${targetBlock}...`);
 
-    // 5. Send Bundle Payload to Flashbots Relay Endpoint
     const response = await fetch(FLASHBOTS_RELAY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -431,7 +393,7 @@ async function executeLiquidationBundle(targetUser, healthFactor, totalDebtUSD) 
 }
 
 // -------------------------------------------------------------------
-// PROCESS EXCEPTION HANDLERS (KEEPS BOT ALIVE ON UNEXPECTED ERRORS)
+// PROCESS EXCEPTION HANDLERS & EVENT LOOP KEEP-ALIVE
 // -------------------------------------------------------------------
 process.on("uncaughtException", (err) => {
   logger(`⚠️ Global Uncaught Exception: ${err.message || err}`);
@@ -441,16 +403,25 @@ process.on("unhandledRejection", (reason, promise) => {
   logger(`⚠️ Global Unhandled Rejection at: ${promise} reason: ${reason}`);
 });
 
+process.on("SIGTERM", async () => {
+  await logger("🛑 SIGTERM received. Shutting down worker gracefully...");
+  process.exit(0);
+});
+
+// Force Node.js event loop to remain active continuously without open HTTP ports
+setInterval(() => {}, 1000 * 60 * 60);
+
 // -------------------------------------------------------------------
 // INITIALIZATION
 // -------------------------------------------------------------------
 async function main() {
-  logger("====================================================");
-  logger("🤖 Aave V3 Flashbots Bundle Liquidator (Back4app Ready)");
-  logger(`Deployer Wallet: ${wallet.address}`);
-  logger(`Contract:        ${FLASH_LIQUIDATOR_ADDRESS}`);
-  logger(`Flashbots Relay: ${FLASHBOTS_RELAY_URL}`);
-  logger("====================================================\n");
+  await logger("====================================================");
+  await logger("🤖 Aave V3 Headless Liquidator Worker (Back4app)");
+  await logger(`Deployer Wallet: ${wallet.address}`);
+  await logger(`Contract:        ${FLASH_LIQUIDATOR_ADDRESS}`);
+  await logger(`Flashbots Relay: ${FLASHBOTS_RELAY_URL}`);
+  await logger(`ntfy Topic:      https://ntfy.sh/${NTFY_TOPIC}`);
+  await logger("====================================================\n");
 
   loadCachedBorrowers();
   await syncGasAndNonce();
