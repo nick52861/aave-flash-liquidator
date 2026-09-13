@@ -1,4 +1,5 @@
 process.stdout._handle && process.stdout._handle.setBlocking && process.stdout._handle.setBlocking(true);
+import http from "http";
 import { ethers } from "ethers";
 import dotenv from "dotenv";
 import fs from "fs";
@@ -7,6 +8,17 @@ import WebSocket from "ws";
 import { Worker } from "worker_threads";
 
 dotenv.config();
+
+// -------------------------------------------------------------------
+// BACK4APP DUMMY HEALTH CHECK (Satisfies Port 8080 Probe)
+// -------------------------------------------------------------------
+const PORT = process.env.PORT || 8080;
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+}).listen(PORT, "0.0.0.0", () => {
+  console.log(`[HEALTH] Dummy listener active on port ${PORT}`);
+});
 
 // -------------------------------------------------------------------
 // CONFIGURATION
